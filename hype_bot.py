@@ -27,7 +27,7 @@ import csv  # quintiles用
 CONFIG = {
     # 取引設定
     "symbol": "HYPE",
-    "position_size_usd": 100,      # 1回のポジションサイズ（USD）
+    "position_size_usd": 250,      # 1回のポジションサイズ（USD）
     "leverage": 3,                  # レバレッジ
     "tp_percent": 10.0,            # Take Profit %
     "sl_percent": 5.0,             # Stop Loss %
@@ -39,6 +39,7 @@ CONFIG = {
 
     # ログ設定
     "log_file": Path(__file__).parent / "bot_log.txt",
+    "trade_history": Path(__file__).parent / "trade_history.csv",
 }
 
 # === ロギング設定 ===
@@ -226,7 +227,80 @@ class HypeBot:
         else:
             self.exchange = None
 
+        # 取引履歴の初期化
+        self.current_trade = None  # 進行中のトレード
+        self._init_trade_history()
+
         logger.info(f"Bot初期化完了 (dry_run={dry_run})")
+
+    def _init_trade_history(self):
+        """取引履歴CSVを初期化"""
+        if not CONFIG["trade_history"].exists():
+            with open(CONFIG["trade_history"], 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'entry_time', 'exit_time', 'side', 'size',
+                    'entry_price', 'exit_price', 'pnl_usd', 'pnl_pct',
+                    'exit_type', 'oi_q', 'fr_q', 'fee_q'
+                ])
+
+    def record_trade(self, entry_time, exit_time, side, size, entry_price, exit_price, exit_type, quintiles):
+        """取引を記録"""
+        if side == "long":
+            pnl_usd = (exit_price - entry_price) * size
+            pnl_pct = (exit_price - entry_price) / entry_price * 100
+        else:
+            pnl_usd = (entry_price - exit_price) * size
+            pnl_pct = (entry_price - exit_price) / entry_price * 100
+
+        with open(CONFIG["trade_history"], 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                entry_time, exit_time, side, f"{size:.4f}",
+                f"{entry_price:.2f}", f"{exit_price:.2f}",
+                f"{pnl_usd:.2f}", f"{pnl_pct:.2f}",
+                exit_type,
+                quintiles.get('oi', ''), quintiles.get('fr', ''), quintiles.get('fee', '')
+            ])
+
+        logger.info(f"取引記録: {side} {size:.4f} @ ${entry_price:.2f} → ${exit_price:.2f} | PnL: ${pnl_usd:.2f} ({pnl_pct:+.2f}%)")
+
+    def check_position_closed(self):
+        """ポジションがクローズされたかチェック"""
+        if not self.current_trade:
+            return
+
+        pos = self.get_position()
+        if pos is None:
+            return
+
+        # ポジションがなくなった = クローズされた
+        if pos.get("size", 0) == 0 and self.current_trade:
+            # 現在価格を取得してPnL計算
+            try:
+                meta = self.info.meta_and_asset_ctxs()
+                for i, asset in enumerate(meta[0]["universe"]):
+                    if asset["name"] == CONFIG["symbol"]:
+                        exit_price = float(meta[1][i]["markPx"])
+                        break
+
+                entry = self.current_trade
+                exit_type = "TP" if exit_price > entry["entry_price"] else "SL"
+
+                self.record_trade(
+                    entry["entry_time"],
+                    datetime.now(timezone.utc).isoformat(),
+                    entry["side"],
+                    entry["size"],
+                    entry["entry_price"],
+                    exit_price,
+                    exit_type,
+                    entry.get("quintiles", {})
+                )
+
+                self.current_trade = None
+            except Exception as e:
+                logger.error(f"クローズ記録エラー: {e}")
 
     def get_current_values(self):
         """現在の指標値をリアルタイム取得"""
@@ -389,6 +463,9 @@ class HypeBot:
         logger.info("=" * 50)
         logger.info("シグナルチェック開始")
 
+        # ポジションクローズをチェック
+        self.check_position_closed()
+
         # 現在値取得
         values = self.get_current_values()
         if not values:
@@ -427,6 +504,19 @@ class HypeBot:
         if result:
             self.set_tp_sl(price, "long")
 
+            # 取引情報を保存（クローズ時の記録用）
+            self.current_trade = {
+                "entry_time": datetime.now(timezone.utc).isoformat(),
+                "side": "long",
+                "size": size,
+                "entry_price": price,
+                "quintiles": {
+                    "oi": results.get("oi_usd", {}).get("quintile", ""),
+                    "fr": results.get("fr_ma7", {}).get("quintile", ""),
+                    "fee": results.get("fee_ma7", {}).get("quintile", ""),
+                }
+            }
+
     def run_loop(self):
         """ループ実行"""
         logger.info("Bot開始（Ctrl+Cで終了）")
@@ -443,12 +533,61 @@ class HypeBot:
                 logger.error(f"エラー: {e}")
                 time.sleep(60)
 
+# === 成績サマリー ===
+def show_stats():
+    """取引履歴から成績を表示"""
+    if not CONFIG["trade_history"].exists():
+        print("取引履歴がありません")
+        return
+
+    with open(CONFIG["trade_history"]) as f:
+        reader = csv.DictReader(f)
+        trades = list(reader)
+
+    if not trades:
+        print("取引履歴がありません")
+        return
+
+    wins = [t for t in trades if float(t['pnl_usd']) > 0]
+    losses = [t for t in trades if float(t['pnl_usd']) <= 0]
+
+    total_pnl = sum(float(t['pnl_usd']) for t in trades)
+    total_wins = sum(float(t['pnl_usd']) for t in wins)
+    total_losses = abs(sum(float(t['pnl_usd']) for t in losses))
+
+    win_rate = len(wins) / len(trades) * 100 if trades else 0
+    pf = total_wins / total_losses if total_losses > 0 else float('inf')
+
+    print("\n" + "=" * 50)
+    print("  取引成績サマリー")
+    print("=" * 50)
+    print(f"  総取引数:    {len(trades)}")
+    print(f"  勝ち:        {len(wins)}")
+    print(f"  負け:        {len(losses)}")
+    print(f"  勝率:        {win_rate:.1f}%")
+    print(f"  総損益:      ${total_pnl:+.2f}")
+    print(f"  総利益:      ${total_wins:.2f}")
+    print(f"  総損失:      ${total_losses:.2f}")
+    print(f"  PF:          {pf:.2f}")
+    print("=" * 50)
+
+    print("\n【直近5取引】")
+    for t in trades[-5:]:
+        pnl = float(t['pnl_usd'])
+        symbol = "+" if pnl > 0 else ""
+        print(f"  {t['entry_time'][:10]} | {t['side']} | ${t['entry_price']} → ${t['exit_price']} | {symbol}${pnl:.2f} ({t['exit_type']})")
+
 # === メイン ===
 def main():
     parser = argparse.ArgumentParser(description="HYPE自動取引Bot")
     parser.add_argument("--dry-run", action="store_true", help="テスト実行（注文しない）")
     parser.add_argument("--once", action="store_true", help="1回だけ実行")
+    parser.add_argument("--stats", action="store_true", help="取引成績を表示")
     args = parser.parse_args()
+
+    if args.stats:
+        show_stats()
+        return
 
     if not HAS_SDK:
         print("エラー: pip install hyperliquid-python-sdk を実行してください")

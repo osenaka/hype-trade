@@ -198,3 +198,129 @@ Claude に「llama_cacheを更新して」と指示
 - `fr_premium`（mark-index乖離） → HL APIへのVMプロキシ403 + `fr_daily_sum`と高相関のため断念
 
 **`daily_features.csv` の最終状態:** 33列・1017行（2023-06-09〜2026-03-21）
+
+### 2026-03-29
+
+**自動取引Bot完成 & VPSデプロイ**
+
+**追加したファイル:**
+- `hype_bot.py` — 自動取引Bot本体（シグナル検出→Longエントリー→TP/SL決済）
+- `signal_monitor.py` — シグナル監視スクリプト（取引なし）
+- `update_daily_data.py` — 日次データ蓄積スクリプト
+
+**Bot戦略:**
+- 条件: OI低(Q1-Q2) × FR低中(Q1-Q3) × Fee中(Q2-Q3) → Longエントリー
+- バックテスト結果: 勝率84%、PF 10.67
+- TP +10% / SL -5%
+
+**リアルタイム化:**
+- 全指標をAPIからリアルタイム取得（CSV依存なし）
+- FR MA7: Hyperliquid `fundingHistory` API
+- Fee MA7: Hypurrscan API
+
+**VPSデプロイ（ConoHa）:**
+- Ubuntu 22.04 / 2GB RAM
+- screenで常駐化
+
+---
+
+## 自動取引Bot
+
+### Bot設定（hype_bot.py）
+
+```python
+CONFIG = {
+    "position_size_usd": 250,   # ポジションサイズ（USD）
+    "leverage": 3,               # レバレッジ → 実効$750
+    "tp_percent": 10.0,          # 利確 +10%
+    "sl_percent": 5.0,           # 損切 -5%
+    "check_interval": 3600,      # チェック間隔（1時間）
+}
+```
+
+### 環境変数（.env）
+
+```
+HYPERLIQUID_PRIVATE_KEY=秘密鍵
+HYPERLIQUID_WALLET_ADDRESS=ウォレットアドレス
+```
+
+### 実行コマンド
+
+```bash
+# テスト（注文しない）
+python3 hype_bot.py --dry-run --once  # 1回
+python3 hype_bot.py --dry-run         # ループ
+
+# 本番
+python3 hype_bot.py
+```
+
+### シグナル監視のみ
+
+```bash
+python3 signal_monitor.py
+```
+
+---
+
+## VPSデプロイ手順
+
+### 1. VPS契約
+
+- ConoHa VPS 2GB（739円/月〜）
+- Ubuntu 22.04
+- セキュリティグループでSSH(22)許可
+
+### 2. SSH接続
+
+```bash
+ssh root@VPSのIPアドレス
+```
+
+### 3. 環境構築
+
+```bash
+apt update && apt install git python3-pip screen -y
+git clone https://github.com/osenaka/hype-trade.git
+cd hype-trade
+pip3 install hyperliquid-python-sdk python-dotenv
+```
+
+### 4. 秘密鍵設定
+
+```bash
+nano .env
+# HYPERLIQUID_PRIVATE_KEY=xxx
+# HYPERLIQUID_WALLET_ADDRESS=xxx
+```
+
+### 5. 動作確認
+
+```bash
+python3 hype_bot.py --dry-run --once
+```
+
+### 6. 常駐起動
+
+```bash
+screen -S hypebot
+python3 hype_bot.py
+# Ctrl+A → D で抜ける（バックグラウンド継続）
+```
+
+### 7. 再接続・停止
+
+```bash
+screen -r hypebot    # 再接続
+# Ctrl+C で停止
+```
+
+---
+
+## 注意事項（Bot運用）
+
+- 秘密鍵は絶対にGitHubにアップしない（.gitignoreで除外済み）
+- Bot用ウォレットは少額で運用推奨
+- 本番前に必ず`--dry-run`でテスト
+- ログは `bot_log.txt` に出力
